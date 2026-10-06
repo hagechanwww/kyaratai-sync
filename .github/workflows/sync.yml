@@ -1,12 +1,17 @@
 # キャラ対の Discord → Notion 転記を GitHub Actions で定期実行する。
-# - 30分ごと（GitHubの都合で数分〜十数分遅れることがある）。リポジトリ変数 SYNC_ENABLED が true のときだけ動く
+# - 公開リポジトリなら5分ごと、非公開なら30分ごと（GitHubの都合で数分〜十数分遅れることがある）
+#   非公開のGitHub Actionsは無料枠が月2,000分しかないため、5分ごと（月約9,000分）は公開リポジトリのときだけ動かす
+# - リポジトリ変数 SYNC_ENABLED が true のときだけ動く
 # - 手動実行（Actions → キャラ対転記 → Run workflow）で checkSetup / sync / rescanCovers を選べる
 # - 進み具合は state/state.json に保存して、このリポジトリにコミットする（トークンは保存しない）
 name: キャラ対転記
 
 on:
   schedule:
+    # 非公開でも動く枠（30分ごと）
     - cron: '7,37 * * * *'
+    # 公開リポジトリのときだけ動く枠（上と合わせて5分ごと）。毎時0分はGitHubが混むので外す
+    - cron: '2,12,17,22,27,32,42,47,52,57 * * * *'
   workflow_dispatch:
     inputs:
       task:
@@ -25,7 +30,11 @@ permissions:
 
 jobs:
   run:
-    if: github.event_name == 'workflow_dispatch' || vars.SYNC_ENABLED == 'true'
+    # 非公開のときは30分ごとの枠だけ（飛ばした回は無料枠を使わない）
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (vars.SYNC_ENABLED == 'true' &&
+       (github.event.schedule == '7,37 * * * *' || github.event.repository.private == false))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -42,6 +51,11 @@ jobs:
       - name: 進み具合を保存
         if: always()
         run: |
+          # 公開リポジトリは60日間コミットが無いと定期実行が止められるので、
+          # 投稿が無い時期が続いても45日ごとに日付を書いてコミットする
+          if [ $(( $(date +%s) - $(git log -1 --format=%ct) )) -gt $(( 45 * 24 * 3600 )) ]; then
+            date -u +%Y-%m-%dT%H:%M:%SZ > state/keepalive.txt
+          fi
           if [ -n "$(git status --porcelain state)" ]; then
             git config user.name "kyaratai-sync"
             git config user.email "kyaratai-sync@users.noreply.github.com"
