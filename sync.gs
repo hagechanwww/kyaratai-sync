@@ -144,7 +144,7 @@ function checkSetup() {
     const ds = notionDataSource_(ctx, { dryRun: true });
     if (ds.pending) {
       ctx.pages = []; // まだデータベースが無い = 全チャンネルのページを新しく作る
-      out('Notionのページ: ' + ds.pageTitle + ' … OK（中にまだデータベースが無いので、startSync のときに「'
+      out('Notionのページ: ' + ds.pageTitle + ' … OK（中にまだデータベースが無いので、最初の転記（sync）のときに「'
         + CONFIG.GALLERY_TITLE + '」のギャラリーを自動で作ります）');
     } else {
       out('Notionデータベース: ' + ds.title + '（ページ ' + notionPages_(ctx).length + ' 件） … OK');
