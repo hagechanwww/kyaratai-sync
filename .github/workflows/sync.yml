@@ -1,0 +1,52 @@
+# キャラ対の Discord → Notion 転記を GitHub Actions で定期実行する。
+# - 30分ごと（GitHubの都合で数分〜十数分遅れることがある）。リポジトリ変数 SYNC_ENABLED が true のときだけ動く
+# - 手動実行（Actions → キャラ対転記 → Run workflow）で checkSetup / sync / rescanCovers を選べる
+# - 進み具合は state/state.json に保存して、このリポジトリにコミットする（トークンは保存しない）
+name: キャラ対転記
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      task:
+        description: '実行するもの'
+        type: choice
+        options: [checkSetup, sync, rescanCovers]
+        default: checkSetup
+
+# 同時に2つ動かない（進み具合が食い違わないように）
+concurrency:
+  group: kyaratai-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    if: github.event_name == 'workflow_dispatch' || vars.SYNC_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 実行
+        run: node runner/run.js "${{ github.event.inputs.task || 'sync' }}"
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_URL: ${{ secrets.NOTION_URL }}
+      - name: 進み具合を保存
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state)" ]; then
+            git config user.name "kyaratai-sync"
+            git config user.email "kyaratai-sync@users.noreply.github.com"
+            git add state
+            git commit -m "進み具合を更新"
+            git pull --rebase
+            git push
+          fi
