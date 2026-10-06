@@ -183,7 +183,7 @@ function checkSetup() {
   }
   if (plan.excluded.length) out('除外: ' + plan.excluded.map((c) => '#' + c.name).join(' '));
   out('');
-  out('問題なければ startSync を実行してください。');
+  out('問題なければ転記を始めてください（GitHub Actions なら変数 SYNC_ENABLED を true に。GAS なら startSync を実行）。');
   return lines.join('\n');
 }
 
