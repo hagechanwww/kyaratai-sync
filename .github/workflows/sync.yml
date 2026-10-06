@@ -1,16 +1,17 @@
-# キャラ対の Discord → Notion 転記を GitHub Actions で定期実行する。
-# - 公開リポジトリなら5分ごと、非公開なら30分ごと（GitHubの都合で数分〜十数分遅れることがある）
-#   非公開のGitHub Actionsは無料枠が月2,000分しかないため、5分ごと（月約9,000分）は公開リポジトリのときだけ動かす
-# - リポジトリ変数 SYNC_ENABLED が true のときだけ動く
+# キャラ対の Discord → Notion 転記を GitHub Actions で動かす。
+# - ふだんの5分ごとの起動は、GAS のタイマー（timer.gs）がこのワークフローを呼ぶ（timer = true）。
+#   GitHub 自身の定期実行は遅れたり飛ばされたりしやすく、5分ごとにしても4時間半で2回しか動かなかった（2026-10-06）ので、下の schedule は予備
+# - 5分ごと（タイマーと、予備の5分枠）は公開リポジトリのときだけ動く。非公開だと無料枠（月2,000分）に収まらないため、30分枠だけになる
+# - 自動の実行（タイマー・定期実行）は、リポジトリ変数 SYNC_ENABLED が true のときだけ。手動実行はいつでも動く
 # - 手動実行（Actions → キャラ対転記 → Run workflow）で checkSetup / sync / rescanCovers を選べる
 # - 進み具合は state/state.json に保存して、このリポジトリにコミットする（トークンは保存しない）
 name: キャラ対転記
 
 on:
   schedule:
-    # 非公開でも動く枠（30分ごと）
+    # 予備: 非公開でも動く枠（30分ごと）
     - cron: '7,37 * * * *'
-    # 公開リポジトリのときだけ動く枠（上と合わせて5分ごと）。毎時0分はGitHubが混むので外す
+    # 予備: 公開リポジトリのときだけ動く枠（上と合わせて5分ごと）。毎時0分はGitHubが混むので外す
     - cron: '2,12,17,22,27,32,42,47,52,57 * * * *'
   workflow_dispatch:
     inputs:
@@ -19,6 +20,10 @@ on:
         type: choice
         options: [checkSetup, sync, rescanCovers]
         default: checkSetup
+      timer:
+        description: 'GASのタイマーからの自動実行（手で実行するときはチェックしない）'
+        type: boolean
+        default: false
 
 # 同時に2つ動かない（進み具合が食い違わないように）
 concurrency:
@@ -30,9 +35,9 @@ permissions:
 
 jobs:
   run:
-    # 非公開のときは30分ごとの枠だけ（飛ばした回は無料枠を使わない）
+    # 飛ばした回は無料枠を使わない
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && !inputs.timer) ||
       (vars.SYNC_ENABLED == 'true' &&
        (github.event.schedule == '7,37 * * * *' || github.event.repository.private == false))
     runs-on: ubuntu-latest
@@ -42,8 +47,13 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+      - name: 設定の確認
+        run: |
+          echo "自動転記（変数 SYNC_ENABLED）: ${{ vars.SYNC_ENABLED == 'true' && 'オン' || format('オフ（今の値: 「{0}」。自動にするには true）', vars.SYNC_ENABLED) }}"
+          echo "リポジトリ: ${{ github.event.repository.private == false && '公開（5分ごと）' || '非公開（30分ごと）' }}"
+          echo "起動: ${{ inputs.timer && 'GASのタイマー' || github.event_name }}"
       - name: 実行
-        run: node runner/run.js "${{ github.event.inputs.task || 'sync' }}"
+        run: node runner/run.js "${{ inputs.task || 'sync' }}"
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
