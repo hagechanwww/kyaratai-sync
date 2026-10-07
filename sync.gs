@@ -4,16 +4,17 @@
  *   runner/run.js（Node.js。GitHub Actions で定期実行）から読み込んで動かす。GASの部品は
  *   runner/gas-shim.js が代わりを務めるので、中身はGAS向けの書き方のまま。
  *
- * Discord の指定カテゴリ（既定「キャラ対」）の投稿を、Notion のデータベース（ギャラリー）の
- * 同じ名前のページへ自動で追記する。チャンネルで一番最初に貼られた画像は、そのページの
- * カバー画像（＝ギャラリーのサムネ）にする（CONFIG.COVER_RULE で「最初の画像」にも切り替えられる）。
+ * Discord のカテゴリごとに、Notion の同じ名前のデータベース（ギャラリー）を用意し、
+ * チャンネルの投稿を同じ名前のページへ自動で追記する（既定はサーバーのすべてのカテゴリ。CONFIG.CATEGORIES）。
+ * ギャラリーが無ければ NOTION_URL のページの中に作る。
  *
- * サムネは既定で「ピン留めした画像」（CONFIG.COVER_RULE）。
+ * サムネは既定で「ピン留めした画像」（CONFIG.COVER_RULE。「最初の画像」にも切り替えられる）。
  *
  * 使い方（詳しくは references/setup.md）:
  *   1. スクリプトプロパティに DISCORD_BOT_TOKEN / NOTION_TOKEN / NOTION_URL を入れる
- *      NOTION_URL は既存のギャラリー（データベース）のリンクか、空のページのリンク。
- *      空のページなら、startSync のときにその中へ「キャラ対」ギャラリーを自動で作る
+ *      NOTION_URL は既存のギャラリー（データベース）のリンクか、ページのリンク。
+ *      ページなら、その中へカテゴリごとのギャラリーを自動で作る。既存のギャラリーなら、そこへ MAIN_CATEGORY を入れ、
+ *      ほかのカテゴリはそのギャラリーがあるページに作る
  *   2. checkSetup を実行 → ログで「チャンネル → Notionページ」の対応を確認（何も書き込まない）
  *   3. startSync を実行 → 5分ごとの自動転記が始まる（初回は過去の投稿もさかのぼって転記）
  *   止めるときは stopSync。最初の画像を消して差し替えたときは rescanCovers。
@@ -28,8 +29,14 @@
  */
 
 const CONFIG = {
-  // 転記するカテゴリの名前（Discord側）
-  CATEGORY_NAME: 'キャラ対',
+  // 転記するカテゴリ（Discord側）。'*' はサーバーのすべてのカテゴリ。名前を並べればそのカテゴリだけ
+  // （カテゴリに入っていないチャンネルは転記しない）
+  CATEGORIES: ['*'],
+  // 転記しないカテゴリの名前（例: ['ルール', '雑談']）
+  EXCLUDE_CATEGORIES: [],
+  // カテゴリごとに Notion の同じ名前のギャラリーへ転記する。NOTION_URL が既存のギャラリー（データベース）の
+  // リンクなら、このカテゴリはそのギャラリーへ入れ、ほかのカテゴリはそのギャラリーがあるページに新しく作る
+  MAIN_CATEGORY: 'キャラ対',
   // ボットが複数のサーバーに入っているときに選ぶサーバー名（DISCORD_GUILD_ID を入れればそちらが優先）
   GUILD_NAME: 'キャラ対',
   // チャンネル名とNotionのページ名が自動で結び付かないときだけ書く: { 'チャンネル名': 'ページ名' }
@@ -38,8 +45,6 @@ const CONFIG = {
   EXCLUDE_CHANNELS: [],
   // 同じ名前のページが無いとき、データベースに新しく作るか
   CREATE_MISSING_PAGES: true,
-  // NOTION_URL が空のページのとき、その中に自動で作るギャラリーの名前
-  GALLERY_TITLE: 'キャラ対',
   // スト6のキャラ名の読み替え（ディージェイ＝DJ、ザンギエフ＝ザンギ など。下の SF6_ALIASES）を使うか
   USE_SF6_ALIASES: true,
   // チャンネル内のスレッド（フォーラムの投稿を含む）も同じページに追記するか
@@ -94,7 +99,8 @@ const P_PAGE = 'pg:';      // チャンネルID → NotionページID
 const P_COVER = 'cv:';     // チャンネルID → カバーにした画像の投稿ID（COVER_RULE='first'）
 const P_PIN = 'pin:';      // チャンネルID → カバーにしたピン留めの投稿ID。'-' は「見たが画像なし」（COVER_RULE='pinned'）
 const P_ARCHIVED = 'ar:';  // チャンネルID → アーカイブ済みスレッドの取り込み完了
-const P_NOTION_DS = 'NOTION_DS_CACHE';
+const P_DS = 'ds:';        // カテゴリID → Notionのデータソース（ギャラリー）の覚え書き
+const P_NOTION_DS_LEGACY = 'NOTION_DS_CACHE'; // カテゴリごとにする前の覚え書き（MAIN_CATEGORY のギャラリーとして引き継ぐ）
 const P_GUILD = 'GUILD_CACHE';
 
 // ===== 入口（GASの「実行」から選ぶ関数） =====
@@ -141,14 +147,8 @@ function checkSetup() {
     problem(e);
   }
   try {
-    const ds = notionDataSource_(ctx, { dryRun: true });
-    if (ds.pending) {
-      ctx.pages = []; // まだデータベースが無い = 全チャンネルのページを新しく作る
-      out('Notionのページ: ' + ds.pageTitle + ' … OK（中にまだデータベースが無いので、最初の転記（sync）のときに「'
-        + CONFIG.GALLERY_TITLE + '」のギャラリーを自動で作ります）');
-    } else {
-      out('Notionデータベース: ' + ds.title + '（ページ ' + notionPages_(ctx).length + ' 件） … OK');
-    }
+    const root = notionRoot_(ctx);
+    out((root.kind === 'database' ? 'Notionのギャラリー: ' : 'Notionのページ: ') + root.title + ' … OK');
   } catch (e) {
     problem(e);
   }
@@ -159,32 +159,54 @@ function checkSetup() {
   }
 
   const plan = listTargets_(ctx, { probeOnly: true });
-  out('');
-  out('カテゴリ「' + CONFIG.CATEGORY_NAME + '」のチャンネル: ' + plan.parents.length + ' 個');
-  for (const ch of plan.parents) {
-    const saved = getProp_(ctx, P_PAGE + ch.id);
-    let dest;
-    if (saved) {
-      dest = '→ 設定済みのページ';
-    } else {
-      const m = matchPage_(ctx, ch.name);
-      if (m && m.page) dest = '→「' + m.page.title + '」' + (m.how === 'exact' ? '' : m.how === 'alias' ? '（読み替え）' : '（' + m.how + '。合っているか確認）');
-      else if (m && m.create) dest = '→「' + m.create + '」を新しく作ります（CHANNEL_TO_PAGE の指定）';
-      else if (m && m.ambiguous) dest = '→ 候補が複数（' + m.ambiguous.map((p) => p.title).join(' / ') + '）。CHANNEL_TO_PAGE で指定してください';
-      else dest = CONFIG.CREATE_MISSING_PAGES ? '→ 同じ名前のページが無いので新しく作ります' : '→ 同じ名前のページが無いので転記しません';
+  for (const group of plan.categories) {
+    const cat = group.category;
+    out('');
+    let ds;
+    try {
+      ds = dsForCategory_(ctx, cat, { dryRun: true });
+    } catch (e) {
+      if (!e.userFacing) throw e;
+      ok = false;
+      out('カテゴリ「' + cat.name + '」 → ★' + e.message);
+      continue;
     }
-    const probe = probeChannel_(ctx, ch);
-    let cover = '';
-    if (CONFIG.COVER_RULE === 'pinned' && MESSAGE_CHANNEL_TYPES.indexOf(ch.type) >= 0 && probe.indexOf('★') < 0) {
-      const pin = pinnedImage_(ctx, ch.id);
-      cover = pin ? '  [サムネ: ピン留めの画像 ' + pin.attachment.filename + ']' : '  [サムネ: ピン留めの画像なし→今のカバーのまま]';
-    }
-    out('  #' + ch.name + '  ' + dest + probe + cover);
+    out('カテゴリ「' + cat.name + '」（' + group.channels.length + ' チャンネル） → ' + (ds.pending
+      ? 'Notionに「' + cat.name + '」ギャラリーを最初の転記のときに作ります'
+      : 'Notionのギャラリー「' + ds.title + '」（ページ ' + notionPages_(ctx, ds).length + ' 件）'));
+    for (const ch of group.channels) out(checkLine_(ctx, ds, ch));
   }
-  if (plan.excluded.length) out('除外: ' + plan.excluded.map((c) => '#' + c.name).join(' '));
+  if (plan.excluded.length) out('除外したチャンネル: ' + plan.excluded.map((c) => '#' + c.name).join(' '));
+  if (plan.excludedCategories.length) out('転記しないカテゴリ: ' + plan.excludedCategories.map((c) => c.name).join(' / '));
+  if (plan.uncategorized.length) {
+    out('カテゴリに入っていないチャンネル（転記しません）: ' + plan.uncategorized.map((c) => '#' + c.name).join(' '));
+  }
   out('');
-  out('問題なければ転記を始めてください（GitHub Actions なら変数 SYNC_ENABLED を true に。GAS なら startSync を実行）。');
+  out(ok ? '問題なければ転記を始めてください（GitHub Actions なら変数 SYNC_ENABLED を true に。GAS なら startSync を実行）。'
+    : '★の項目を直してから、もう一度 checkSetup を実行してください。');
   return lines.join('\n');
+}
+
+/** checkSetup の1行: チャンネル → 転記先のページ・読めるか・サムネの見込み */
+function checkLine_(ctx, ds, ch) {
+  const saved = getProp_(ctx, P_PAGE + ch.id);
+  let dest;
+  if (saved) {
+    dest = '→ 設定済みのページ';
+  } else {
+    const m = matchPage_(ctx, ds, ch.name);
+    if (m && m.page) dest = '→「' + m.page.title + '」' + (m.how === 'exact' ? '' : m.how === 'alias' ? '（読み替え）' : '（' + m.how + '。合っているか確認）');
+    else if (m && m.create) dest = '→「' + m.create + '」を新しく作ります（CHANNEL_TO_PAGE の指定）';
+    else if (m && m.ambiguous) dest = '→ 候補が複数（' + m.ambiguous.map((p) => p.title).join(' / ') + '）。CHANNEL_TO_PAGE で指定してください';
+    else dest = CONFIG.CREATE_MISSING_PAGES ? '→ 同じ名前のページが無いので新しく作ります' : '→ 同じ名前のページが無いので転記しません';
+  }
+  const probe = probeChannel_(ctx, ch);
+  let cover = '';
+  if (CONFIG.COVER_RULE === 'pinned' && MESSAGE_CHANNEL_TYPES.indexOf(ch.type) >= 0 && probe.indexOf('★') < 0) {
+    const pin = pinnedImage_(ctx, ch.id);
+    cover = pin ? '  [サムネ: ピン留めの画像 ' + pin.attachment.filename + ']' : '  [サムネ: ピン留めの画像なし→今のカバーのまま]';
+  }
+  return '  #' + ch.name + '  ' + dest + probe + cover;
 }
 
 /** 自動転記を始める（5分ごとのトリガーを入れて、1回目をすぐ実行する）。 */
@@ -195,7 +217,7 @@ function startSync() {
   if (contentIntentOn_(discord_(ctx, '/applications/@me')) === false) {
     throw userError_('メッセージの中身を読む許可（MESSAGE CONTENT INTENT）がOFFです。checkSetup の案内に従ってONにしてください。');
   }
-  notionDataSource_(ctx);
+  notionRoot_(ctx);
   listTargets_(ctx, { probeOnly: true });
   ScriptApp.newTrigger('sync').timeBased().everyMinutes(CONFIG.TRIGGER_MINUTES).create();
   Logger.log(CONFIG.TRIGGER_MINUTES + '分ごとの自動転記を設定しました。続けて1回目を実行します。');
@@ -455,23 +477,36 @@ function listTargets_(ctx, opts) {
   ctx.channelsById = {};
   channels.forEach((c) => { ctx.channelsById[c.id] = c; });
 
-  const cats = channels.filter((c) => c.type === CH_CATEGORY && sameName_(c.name, CONFIG.CATEGORY_NAME));
+  const byPosition = (a, b) => (a.position - b.position) || snowCmp_(a.id, b.id);
+  const allCats = channels.filter((c) => c.type === CH_CATEGORY).sort(byPosition);
+  const cats = allCats.filter((c) => categoryWanted_(c.name));
   if (!cats.length) {
-    const names = channels.filter((c) => c.type === CH_CATEGORY).map((c) => c.name);
-    throw userError_('カテゴリ「' + CONFIG.CATEGORY_NAME + '」が見つかりません。サーバーにあるカテゴリ: ' + names.join(' / '));
+    throw userError_('転記するカテゴリが見つかりません（CATEGORIES: ' + CONFIG.CATEGORIES.join(' / ') + '）。サーバーにあるカテゴリ: '
+      + (allCats.map((c) => c.name).join(' / ') || 'なし'));
   }
-  const catIds = cats.map((c) => c.id);
+  ctx.categoryNames = cats.map((c) => c.name);
   const excluded = CONFIG.EXCLUDE_CHANNELS.map(norm_);
-  const inCategory = channels
-    .filter((c) => catIds.indexOf(c.parent_id) >= 0 && THREAD_PARENT_TYPES.indexOf(c.type) >= 0)
-    .sort((a, b) => (a.position - b.position) || snowCmp_(a.id, b.id));
-  const parents = inCategory.filter((c) => excluded.indexOf(norm_(c.name)) < 0);
   const plan = {
-    parents: parents,
-    excluded: inCategory.filter((c) => excluded.indexOf(norm_(c.name)) >= 0),
+    categories: [],   // { category: {id, name}, channels: [転記するチャンネル] }
+    parents: [],      // 転記するチャンネル（全カテゴリ）
+    excluded: [],     // EXCLUDE_CHANNELS で外したチャンネル
+    excludedCategories: CONFIG.CATEGORIES.indexOf('*') >= 0 ? allCats.filter((c) => cats.indexOf(c) < 0) : [],
+    uncategorized: channels.filter((c) => !c.parent_id && THREAD_PARENT_TYPES.indexOf(c.type) >= 0).sort(byPosition),
     targets: [],
     archivedScanned: [],
   };
+  for (const cat of cats) {
+    const category = { id: cat.id, name: cat.name };
+    const mine = [];
+    channels.filter((c) => c.parent_id === cat.id && THREAD_PARENT_TYPES.indexOf(c.type) >= 0).sort(byPosition).forEach((c) => {
+      c.category = category;
+      if (excluded.indexOf(norm_(c.name)) >= 0) { plan.excluded.push(c); return; }
+      mine.push(c);
+      plan.parents.push(c);
+    });
+    plan.categories.push({ category: category, channels: mine });
+  }
+  const parents = plan.parents;
   if (opts.probeOnly) return plan;
 
   const threadsByParent = {};
@@ -505,6 +540,12 @@ function listTargets_(ctx, opts) {
     });
   }
   return plan;
+}
+
+/** CONFIG.CATEGORIES / EXCLUDE_CATEGORIES で、このカテゴリを転記するか */
+function categoryWanted_(name) {
+  if (CONFIG.EXCLUDE_CATEGORIES.some((x) => sameName_(x, name))) return false;
+  return CONFIG.CATEGORIES.some((x) => x === '*' || sameName_(x, name));
 }
 
 /** アーカイブ済みの公開スレッドを全部集める。読めないチャンネルは null。 */
@@ -609,28 +650,26 @@ function notionUrlRaw_(ctx) {
   return getProp_(ctx, 'NOTION_URL') || getProp_(ctx, 'NOTION_DATABASE');
 }
 
-/**
- * NOTION_URL からデータソースとタイトル列の名前を求める。
- * データベースのリンクならそれを使う。ページのリンクなら中のデータベースを使い、無ければ作る
- * （opts.dryRun のときは作らずに { pending: true } を返す）。
- */
-function notionDataSource_(ctx, opts) {
-  opts = opts || {};
-  if (ctx.ds) return ctx.ds;
+/** NOTION_URL の32桁のID */
+function notionRootId_(ctx) {
   const raw = notionUrlRaw_(ctx) || requiredProp_(ctx, 'NOTION_URL');
   const id = parseNotionId_(raw);
   if (!id) throw userError_('NOTION_URL からIDを読み取れません: ' + raw);
-  const cached = getProp_(ctx, P_NOTION_DS);
-  if (cached) {
-    const c = JSON.parse(cached);
-    if (c.from === id) { ctx.ds = c; return c; }
-  }
-  let db;
+  return id;
+}
+
+/**
+ * NOTION_URL が指すもの。既存のギャラリー（データベース）なら { kind: 'database', db }、
+ * ページなら { kind: 'page' }。どちらでもなければ（接続していない・リンク違い）分かる言葉で止める。
+ */
+function notionRoot_(ctx) {
+  if (ctx.root) return ctx.root;
+  const id = notionRootId_(ctx);
   try {
-    db = notion_(ctx, 'get', '/databases/' + id);
+    const db = notion_(ctx, 'get', '/databases/' + id);
+    ctx.root = { kind: 'database', id: id, db: db, title: plainText_(db.title) || '(無題)' };
   } catch (e) {
     if (e.code !== 404 && e.code !== 400) throw e;
-    // ページのリンクだった場合: 中のデータベースを使う。無ければギャラリーを作る
     let page;
     try {
       page = notion_(ctx, 'get', '/pages/' + id);
@@ -639,34 +678,123 @@ function notionDataSource_(ctx, opts) {
       throw userError_('Notionのページが見つかりません。そのページの右上「…」→「接続」でコネクト（インテグレーション）を'
         + '追加したか、NOTION_URL がそのページのリンクかを確認してください。');
     }
-    db = findChildDatabase_(ctx, id);
-    if (!db) {
-      if (opts.dryRun) return { pending: true, pageTitle: pageTitle_(page) || '(無題)' };
-      db = createGallery_(ctx, id);
-    }
+    ctx.root = { kind: 'page', id: id, title: pageTitle_(page) || '(無題)' };
   }
-  const sources = db.data_sources || [];
-  if (!sources.length) throw userError_('データベースの中身（データソース）が見つかりません');
-  const schema = notion_(ctx, 'get', '/data_sources/' + sources[0].id);
-  const titleProp = Object.keys(schema.properties).filter((k) => schema.properties[k].type === 'title')[0];
-  const ds = { from: id, id: sources[0].id, titleProp: titleProp, title: plainText_(db.title) || '(無題)' };
-  setProp_(ctx, P_NOTION_DS, JSON.stringify(ds));
-  ctx.ds = ds;
-  return ds;
+  return ctx.root;
+}
+
+/** このカテゴリが NOTION_URL の既存のギャラリーへ入るカテゴリか（カテゴリが1つだけならそれ） */
+function isMainCategory_(ctx, cat) {
+  return sameName_(cat.name, CONFIG.MAIN_CATEGORY) || (ctx.categoryNames || []).length === 1;
 }
 
 /**
- * ページの中に「キャラ対」データベースを作り、カバー画像を大きく出すギャラリー表示を付ける。
+ * カテゴリの転記先のデータソース（ギャラリーの中身）とタイトル列の名前を求める。
+ * NOTION_URL がページなら、その中の同じ名前のギャラリー。無ければ作る（opts.dryRun のときは作らずに { pending: true }）。
+ * NOTION_URL が既存のギャラリーなら、MAIN_CATEGORY はそのギャラリー、ほかのカテゴリはそのギャラリーがあるページの中。
+ */
+function dsForCategory_(ctx, cat, opts) {
+  opts = opts || {};
+  ctx.dsByCat = ctx.dsByCat || {};
+  if (ctx.dsByCat[cat.id]) return ctx.dsByCat[cat.id];
+  const remember = (ds) => { ctx.dsByCat[cat.id] = ds; return ds; };
+  const rootId = notionRootId_(ctx);
+  const key = P_DS + cat.id;
+  const cached = getProp_(ctx, key);
+  if (cached) {
+    const c = JSON.parse(cached);
+    if (c.from === rootId) return remember(c);
+  }
+  const legacy = getProp_(ctx, P_NOTION_DS_LEGACY);
+  if (legacy && isMainCategory_(ctx, cat) && JSON.parse(legacy).from === rootId) {
+    setProp_(ctx, key, legacy);
+    deleteProp_(ctx, P_NOTION_DS_LEGACY);
+    return remember(JSON.parse(legacy));
+  }
+
+  const root = notionRoot_(ctx);
+  let db = null;
+  let home = root.id; // 新しいギャラリーを作るページ
+  if (root.kind === 'database') {
+    if (isMainCategory_(ctx, cat)) {
+      db = root.db;
+    } else {
+      home = notionParentPage_(ctx, root.db);
+      const noHome = '「' + cat.name + '」のギャラリーを作る場所がありません。Notionで「' + root.title
+        + '」ギャラリーが入っているページを開き、右上の「…」→「接続」でコネクトをつないでください。';
+      if (!home) throw userError_(noHome);
+      try {
+        notion_(ctx, 'get', '/pages/' + home);
+      } catch (e) {
+        if (e.code === 404 || e.code === 400) throw userError_(noHome);
+        throw e;
+      }
+    }
+  }
+  if (!db) db = findCategoryDatabase_(ctx, home, cat);
+  if (!db) {
+    if (opts.dryRun) return { pending: true, title: cat.name };
+    db = createGallery_(ctx, home, cat.name);
+  }
+  const sources = db.data_sources || [];
+  if (!sources.length) throw userError_('Notionの「' + (plainText_(db.title) || cat.name) + '」の中身（データソース）が見つかりません');
+  const schema = notion_(ctx, 'get', '/data_sources/' + sources[0].id);
+  const titleProp = Object.keys(schema.properties).filter((k) => schema.properties[k].type === 'title')[0];
+  const ds = { from: rootId, id: sources[0].id, titleProp: titleProp, title: plainText_(db.title) || cat.name };
+  setProp_(ctx, key, JSON.stringify(ds));
+  return remember(ds);
+}
+
+/** データベースが入っているページのID（列などのブロックの中なら、その上のページ）。分からなければ null。 */
+function notionParentPage_(ctx, db) {
+  let parent = db.parent;
+  for (let i = 0; parent && i < 5; i++) {
+    if (parent.type === 'page_id') return parent.page_id;
+    if (parent.type !== 'block_id') return null;
+    try {
+      parent = notion_(ctx, 'get', '/blocks/' + parent.block_id).parent;
+    } catch (e) {
+      if (e.stopRun) throw e;
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * ページの中のデータベースから、カテゴリと同じ名前のものを探す。MAIN_CATEGORY は、名前が違っても
+ * ほかのカテゴリの名前でないデータベースが1つだけならそれを使う（カテゴリごとにする前に作ったギャラリーなど）。
+ */
+function findCategoryDatabase_(ctx, pageId, cat) {
+  let children;
+  try {
+    children = notion_(ctx, 'get', '/blocks/' + pageId + '/children?page_size=100');
+  } catch (e) {
+    if (e.stopRun) throw e;
+    return null;
+  }
+  const dbs = (children.results || []).filter((b) => b.type === 'child_database');
+  const titleOf = (b) => (b.child_database && b.child_database.title) || '';
+  let hit = dbs.filter((b) => sameName_(titleOf(b), cat.name));
+  if (!hit.length && isMainCategory_(ctx, cat)) {
+    hit = dbs.filter((b) => !(ctx.categoryNames || []).some((name) => sameName_(name, titleOf(b))));
+    if (hit.length !== 1) hit = [];
+  }
+  return hit.length ? notion_(ctx, 'get', '/databases/' + hit[0].id) : null;
+}
+
+/**
+ * ページの中にカテゴリと同じ名前のデータベースを作り、カバー画像を大きく出すギャラリー表示を付ける。
  * ギャラリー表示が作れなくても転記はできる（表で見えるだけ）ので、そこは失敗しても止めない。
  */
-function createGallery_(ctx, pageId) {
+function createGallery_(ctx, pageId, title) {
   const db = notion_(ctx, 'post', '/databases', {
     parent: { type: 'page_id', page_id: pageId },
-    title: [plain_(CONFIG.GALLERY_TITLE)],
+    title: [plain_(title)],
     is_inline: true,
     initial_data_source: { properties: { '名前': { title: {} } } },
   });
-  Logger.log('Notionに「' + CONFIG.GALLERY_TITLE + '」データベースを作りました');
+  Logger.log('Notionに「' + title + '」データベースを作りました');
   try {
     notion_(ctx, 'post', '/views', {
       database_id: db.id,
@@ -676,10 +804,10 @@ function createGallery_(ctx, pageId) {
       position: { type: 'start' },
       configuration: { type: 'gallery', cover: { type: 'page_cover' }, cover_size: 'large', cover_aspect: 'cover' },
     });
-    Logger.log('ギャラリー表示（カードの画像＝ページのカバー）を付けました');
+    Logger.log('「' + title + '」にギャラリー表示（カードの画像＝ページのカバー）を付けました');
   } catch (e) {
     if (e.stopRun) throw e;
-    Logger.log('ギャラリー表示は自動で付けられませんでした。Notionで「+」→「ギャラリー」を追加し、'
+    Logger.log('「' + title + '」のギャラリー表示は自動で付けられませんでした。Notionで「+」→「ギャラリー」を追加し、'
       + '「…」→「レイアウト」→「カードプレビュー」を「ページカバー画像」にしてください（' + e.message + '）');
   }
   return db;
@@ -691,22 +819,11 @@ function pageTitle_(page) {
   return k ? plainText_(props[k].title) : '';
 }
 
-function findChildDatabase_(ctx, pageId) {
-  let children;
-  try {
-    children = notion_(ctx, 'get', '/blocks/' + pageId + '/children?page_size=100');
-  } catch (e) {
-    return null;
-  }
-  const dbs = (children.results || []).filter((b) => b.type === 'child_database');
-  if (dbs.length !== 1) return null;
-  return notion_(ctx, 'get', '/databases/' + dbs[0].id);
-}
-
-/** データベースのページ一覧（タイトル付き）。1回の実行で1度だけ読む。 */
-function notionPages_(ctx) {
-  if (ctx.pages) return ctx.pages;
-  const ds = notionDataSource_(ctx);
+/** ギャラリーのページ一覧（タイトル付き）。1回の実行で1度だけ読む。まだ無いギャラリーは空。 */
+function notionPages_(ctx, ds) {
+  if (ds.pending) return [];
+  ctx.pagesByDs = ctx.pagesByDs || {};
+  if (ctx.pagesByDs[ds.id]) return ctx.pagesByDs[ds.id];
   const pages = [];
   let cursor;
   do {
@@ -718,7 +835,7 @@ function notionPages_(ctx) {
     });
     cursor = r.has_more ? r.next_cursor : null;
   } while (cursor);
-  ctx.pages = pages;
+  ctx.pagesByDs[ds.id] = pages;
   return pages;
 }
 
@@ -727,8 +844,8 @@ function notionPages_(ctx) {
  * （Discordは「A.K.I.」を「a-k-i」のように変えるため）。完全一致が無ければスト6のキャラ名の
  * 読み替え（「ディージェイ」と「DJ」など）、それも無ければ片方がもう片方を含むもののうち一番長い名前を選ぶ。
  */
-function matchPage_(ctx, channelName) {
-  const pages = notionPages_(ctx).filter((p) => norm_(p.title));
+function matchPage_(ctx, ds, channelName) {
+  const pages = notionPages_(ctx, ds).filter((p) => norm_(p.title));
   const override = overrideFor_(channelName);
   if (override) {
     const hit = pages.filter((p) => norm_(p.title) === norm_(override));
@@ -763,12 +880,13 @@ function overrideFor_(channelName) {
   return k ? CONFIG.CHANNEL_TO_PAGE[k] : null;
 }
 
-/** チャンネルの転記先ページIDを返す。初回は名前で探し、無ければ作る。 */
+/** チャンネルの転記先ページIDを返す。初回はカテゴリのギャラリーから名前で探し、無ければ作る。 */
 function ensurePage_(ctx, channel) {
   const key = P_PAGE + channel.id;
   const saved = getProp_(ctx, key);
   if (saved) return saved;
-  const m = matchPage_(ctx, channel.name);
+  const ds = dsForCategory_(ctx, channel.category);
+  const m = matchPage_(ctx, ds, channel.name);
   if (m && m.page) {
     setProp_(ctx, key, m.page.id);
     Logger.log('#' + channel.name + ' → Notionの「' + m.page.title + '」に転記します');
@@ -783,13 +901,19 @@ function ensurePage_(ctx, channel) {
     Logger.log('#' + channel.name + ': 同じ名前のページが無いので転記しません');
     return null;
   }
-  const ds = notionDataSource_(ctx);
   const title = (m && m.create) || channel.name;
   const props = {};
   props[ds.titleProp] = { title: [plain_(title)] };
-  const page = notion_(ctx, 'post', '/pages', { parent: { type: 'data_source_id', data_source_id: ds.id }, properties: props });
+  let page;
+  try {
+    page = notion_(ctx, 'post', '/pages', { parent: { type: 'data_source_id', data_source_id: ds.id }, properties: props });
+  } catch (e) {
+    // ギャラリーごと消された → 覚え書きを忘れて、次の回に探し直す（無ければ作り直す）
+    if (isPageGone_(e)) { deleteProp_(ctx, P_DS + channel.category.id); delete ctx.dsByCat[channel.category.id]; }
+    throw e;
+  }
   setProp_(ctx, key, page.id);
-  if (ctx.pages) ctx.pages.push({ id: page.id, title: title });
+  if (ctx.pagesByDs && ctx.pagesByDs[ds.id]) ctx.pagesByDs[ds.id].push({ id: page.id, title: title });
   Logger.log('#' + channel.name + ' → Notionに「' + title + '」を新しく作りました');
   return page.id;
 }
