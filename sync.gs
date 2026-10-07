@@ -162,6 +162,10 @@ function checkSetup() {
   for (const group of plan.categories) {
     const cat = group.category;
     out('');
+    if (!group.channels.length) {
+      out('カテゴリ「' + cat.name + '」 → 文字を書くチャンネルが無いので、何もしません');
+      continue;
+    }
     let ds;
     try {
       ds = dsForCategory_(ctx, cat, { dryRun: true });
