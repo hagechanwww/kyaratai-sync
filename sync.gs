@@ -57,6 +57,9 @@ const CONFIG = {
   //   'off'    … カバーを変えない
   // ピン留めが無いチャンネルは、今のカバーのまま変えない
   COVER_RULE: 'pinned',
+  // ピン留めした投稿は本文に入れない（サムネ用の画像が本文にも出ないように）。
+  // 転記した後でピン留めした投稿も、次の回に本文から外す（外すのはこの転記が書いた分だけ。Notionで手で書いたものは残す）
+  SKIP_PINNED: true,
   // Notionに上げられる1ファイルの上限（無料プラン5MB。有料プランなら20まで上げてよい）
   NOTION_FILE_LIMIT_MB: 5,
   // 自動転記の間隔（分）。1 / 5 / 10 / 15 / 30 のどれか
@@ -99,6 +102,7 @@ const P_PAGE = 'pg:';      // チャンネルID → NotionページID
 const P_COVER = 'cv:';     // チャンネルID → カバーにした画像の投稿ID（COVER_RULE='first'）
 const P_PIN = 'pin:';      // チャンネルID → カバーにしたピン留めの投稿ID。'-' は「見たが画像なし」（COVER_RULE='pinned'）
 const P_ARCHIVED = 'ar:';  // チャンネルID → アーカイブ済みスレッドの取り込み完了
+const P_UNPOST = 'rm:';    // チャンネルID → 本文から外すピン留めの投稿IDの一覧（JSON）。外し終わったら消す
 const P_DS = 'ds:';        // カテゴリID → Notionのデータソース（ギャラリー）の覚え書き
 const P_NOTION_DS_LEGACY = 'NOTION_DS_CACHE'; // カテゴリごとにする前の覚え書き（MAIN_CATEGORY のギャラリーとして引き継ぐ）
 const P_GUILD = 'GUILD_CACHE';
@@ -263,6 +267,7 @@ function rescanCovers() {
     for (const ch of plan.parents) {
       if (outOfTime_(ctx)) { Logger.log('時間切れ。もう一度 rescanCovers を実行してください。'); return; }
       const isText = MESSAGE_CHANNEL_TYPES.indexOf(ch.type) >= 0;
+      if (CONFIG.SKIP_PINNED && isText) queueUnpost_(ctx, ch.id, pinnedItems_(ctx, ch.id).map((it) => (it.message || {}).id).filter(Boolean));
       if (CONFIG.COVER_RULE === 'pinned') {
         if (!isText) continue;
         deleteProp_(ctx, P_PIN + ch.id);
@@ -285,6 +290,8 @@ function rescanCovers() {
         Logger.log('#' + ch.name + ': カバーを更新しました（' + best.attachment.filename + '）');
       }
     }
+    unpostPinned_(ctx);
+    if (ctx.stats.unposted.length) Logger.log('ピン留めの投稿を本文から外しました: ' + ctx.stats.unposted.join(' '));
   } finally {
     lock.releaseLock();
   }
@@ -324,9 +331,11 @@ function runSync_(ctx) {
     const mine = plan.targets.filter((t) => t.archivedOf === chId);
     if (mine.every((t) => results[t.id] === 'done' || results[t.id] === 'forbidden')) setProp_(ctx, P_ARCHIVED + chId, '1');
   }
+  if (!stopped) unpostPinned_(ctx);
   const added = Object.keys(ctx.stats.added).map((k) => k + ' ' + ctx.stats.added[k] + '件');
   Logger.log((added.length ? '追記: ' + added.join(' / ') : '新しい投稿はありませんでした')
     + (ctx.stats.covers.length ? ' / カバー更新: ' + ctx.stats.covers.join(' ') : '')
+    + (ctx.stats.unposted.length ? ' / ピン留めを本文から外した: ' + ctx.stats.unposted.join(' ') : '')
     + (stopped ? '（時間切れ。続きは次の回）' : ''));
 }
 
@@ -430,9 +439,14 @@ function appendBlocks_(ctx, pageId, blocks) {
 /** 投稿1件をNotionのブロックにする。最初の画像ならカバーにして、本文には入れない。 */
 function buildMessage_(ctx, t, page, m) {
   const item = { id: m.id, blocks: [], safe: [] };
-  if (m.type === MSG_PIN_NOTICE && t.kind === 'channel') ctx.pinChanged[t.channel.id] = true;
+  if (m.type === MSG_PIN_NOTICE) {
+    if (t.kind === 'channel') ctx.pinChanged[t.channel.id] = true;
+    const pinnedId = m.message_reference && m.message_reference.message_id;
+    if (CONFIG.SKIP_PINNED && pinnedId) queueUnpost_(ctx, t.channel.id, [pinnedId]);
+  }
   if (COPY_MESSAGE_TYPES.indexOf(m.type) < 0) return item;
   if (m.author && m.author.bot && !CONFIG.INCLUDE_BOTS) return item;
+  if (CONFIG.SKIP_PINNED && m.pinned) return item;
 
   const attachments = messageAttachments_(m);
   let coverAttachmentId = null;
@@ -571,17 +585,21 @@ function archivedThreads_(ctx, channel) {
   return all;
 }
 
-/** ピン留めの中で、一番最後にピン留めされた画像付きの投稿を返す。無ければ null。 */
-function pinnedImage_(ctx, channelId) {
+/** チャンネルのピン留め（新しくピン留めした順）。読めなければ空。 */
+function pinnedItems_(ctx, channelId) {
   let r;
   try {
     r = discord_(ctx, '/channels/' + channelId + '/messages/pins', { limit: 50 });
   } catch (e) {
-    if (e.code === 403 || e.code === 404) return null;
+    if (e.code === 403 || e.code === 404) return [];
     throw e;
   }
-  const items = (r.items || []).slice().sort((a, b) => String(b.pinned_at || '').localeCompare(String(a.pinned_at || '')));
-  for (const it of items) {
+  return (r.items || []).slice().sort((a, b) => String(b.pinned_at || '').localeCompare(String(a.pinned_at || '')));
+}
+
+/** ピン留めの中で、一番最後にピン留めされた画像付きの投稿を返す。無ければ null。 */
+function pinnedImage_(ctx, channelId) {
+  for (const it of pinnedItems_(ctx, channelId)) {
     const m = it.message || {};
     const image = messageAttachments_(m).filter(isImage_)[0];
     if (image) return { message: m, attachment: image };
@@ -607,6 +625,79 @@ function refreshPinnedCover_(ctx, channel) {
   setProp_(ctx, key, found.message.id);
   ctx.stats.covers.push(channel.name);
   return true;
+}
+
+/** 本文から外す投稿を覚えておく（失敗しても次の回にやり直せるように、進み具合と一緒に保存する）。 */
+function queueUnpost_(ctx, channelId, messageIds) {
+  const key = P_UNPOST + channelId;
+  const list = JSON.parse(getProp_(ctx, key) || '[]');
+  const add = messageIds.filter((id) => list.indexOf(id) < 0);
+  if (add.length) setProp_(ctx, key, JSON.stringify(list.concat(add)));
+}
+
+/** ピン留めされた投稿を、転記先ページの本文から外す（この転記が書いたブロックだけ）。 */
+function unpostPinned_(ctx) {
+  for (const key of Object.keys(ctx.props).filter((k) => k.indexOf(P_UNPOST) === 0)) {
+    if (outOfTime_(ctx)) return;
+    const channelId = key.slice(P_UNPOST.length);
+    const pageId = getProp_(ctx, P_PAGE + channelId);
+    const ids = JSON.parse(getProp_(ctx, key) || '[]');
+    const name = (ctx.channelsById && ctx.channelsById[channelId] && ctx.channelsById[channelId].name) || channelId;
+    try {
+      if (pageId && ids.length) {
+        const n = removePostsFromPage_(ctx, pageId, ids);
+        if (n) ctx.stats.unposted.push(name + ' ' + n + '件');
+      }
+      deleteProp_(ctx, key);
+    } catch (e) {
+      if (e.stopRun) throw e;
+      if (isPageGone_(e)) { deleteProp_(ctx, key); continue; }
+      Logger.log('#' + name + ' のピン留めの投稿を本文から外せませんでした（次の回にやり直します）: ' + e.message);
+    }
+  }
+}
+
+/**
+ * ページの本文から、指定した投稿（見出し＋そのあとに続く本文・画像）を外す。外した投稿の数を返す。
+ * この転記（コネクト）が作ったブロックだけを外し、人が書いたブロックに当たったらそこで止める。
+ */
+function removePostsFromPage_(ctx, pageId, messageIds) {
+  const me = notionBotId_(ctx);
+  const blocks = [];
+  let cursor;
+  do {
+    const r = notion_(ctx, 'get', '/blocks/' + pageId + '/children' + qs_({ page_size: 100, start_cursor: cursor }));
+    (r.results || []).forEach((b) => blocks.push(b));
+    cursor = r.has_more ? r.next_cursor : null;
+  } while (cursor);
+  const mine = (b) => !!(b.created_by && b.created_by.id === me);
+  const doomed = [];
+  let posts = 0;
+  for (let i = 0; i < blocks.length; i++) {
+    if (!mine(blocks[i]) || messageIds.indexOf(postHeaderId_(blocks[i])) < 0) continue;
+    posts++;
+    doomed.push(blocks[i].id);
+    for (let j = i + 1; j < blocks.length && mine(blocks[j]) && !postHeaderId_(blocks[j]); j++) doomed.push(blocks[j].id);
+  }
+  // 後ろから消す（途中で失敗しても見出しが残るので、次の回に同じ投稿を見つけて続きを消せる）
+  doomed.reverse().forEach((id) => notion_(ctx, 'delete', '/blocks/' + id));
+  return posts;
+}
+
+/** 転記で書いた「投稿者・日時」の見出しなら、その投稿のIDを返す。 */
+function postHeaderId_(b) {
+  if (!b || b.type !== 'paragraph') return null;
+  const rt = (b.paragraph && b.paragraph.rich_text) || [];
+  const link = rt[1] && rt[1].text && rt[1].text.link && rt[1].text.link.url;
+  if (!link || !rt[0].annotations || !rt[0].annotations.bold) return null;
+  const m = String(link).match(/^https:\/\/discord\.com\/channels\/[^/]+\/[^/]+\/(\d+)$/);
+  return m ? m[1] : null;
+}
+
+/** このコネクト（ボット）のNotionのユーザーID */
+function notionBotId_(ctx) {
+  if (!ctx.notionBotId) ctx.notionBotId = notion_(ctx, 'get', '/users/me').id;
+  return ctx.notionBotId;
 }
 
 /** チャンネルを古い順に見て、最初の画像を返す。 */
@@ -1274,7 +1365,7 @@ function newContext_() {
   return {
     t0: Date.now(),
     props: PropertiesService.getScriptProperties().getProperties(),
-    stats: { added: {}, covers: [] },
+    stats: { added: {}, covers: [], unposted: [] },
     pinChanged: {}, // ピン留めの知らせ（type 6）を見たチャンネル
   };
 }
